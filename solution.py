@@ -1,5 +1,6 @@
 import sys
 import time
+import itertools
 
 from game_env import GameEnv
 from game_state import GameState
@@ -18,14 +19,18 @@ Last updated 16/10/2026
 
 
 class Solver:
+    STUDENT_NAME = "Helen Ngo" # These are copied from A2 but was not in the original file
+    STUDENT_ID = "48814553"  # same as above
+    GITHUB_USERNAME = "helen-ngo-2048" # same as above
+
+    QL_EPSILON_START = 1.0
+    QL_EPSILON_END = 0.1
+    QL_LEARNING_RATE = 0.05
 
     def __init__(self, game_env: GameEnv):
         self.game_env = game_env
-        #
-        # TODO: Define any class instance variables you require (e.g. a dictionary mapping (state, action) to Q-value,
-        #  or the weights of your linear Q-function) here.
-        #
-        pass
+        self.q_values = {}
+        self.epsilon = None
 
     @staticmethod
     def testcases_to_attempt():
@@ -60,14 +65,15 @@ class Solver:
         """
         Initialise any variables required before the start of tabular Q-learning.
         """
-        #
-        # TODO: Implement any initialisation for tabular Q-learning (e.g. creating your Q-table) here. This method is
-        #  not timed, but it must not call perform_action (training belongs in ql_train_episode) and must finish
-        #  within 30 seconds, or the phase scores zero.
-        #
-        # In order to ensure compatibility with tester, you should avoid adding additional arguments to this function.
-        #
-        pass
+        # Q-table: {state: {action: q_value}}, every Q-value starts at 0. Only the actions that are valid on the
+        # state's tile get an entry. Terminal states stay in the table but never updates so their Q-values stay 0.
+        self.q_values = {}
+        for state in self.get_all_states():
+            self.q_values[state] = {}
+            for action in self.game_env.get_valid_actions(state):
+                self.q_values[state][action] = 0.0
+
+        self.epsilon = self.QL_EPSILON_START
 
     def ql_train_episode(self):
         """
@@ -161,8 +167,22 @@ class Solver:
         pass
 
     # === Helper Methods ===============================================================================================
-    #
-    #
-    # TODO: Add any additional methods here
-    #
-    #
+
+    def get_all_states(self):
+        """
+        Build the list of every state: each non-Rock tile combined with every possible crystal_status tuple.
+        Return list of GameState
+        """
+        # every way the crystals can be collected. 2 crystals -> (0, 0), (0, 1), (1, 0), (1, 1)
+        crystal_statuses = itertools.product([0, 1], repeat=self.game_env.n_crystals)
+        crystal_statuses = list(crystal_statuses)
+
+        states = []
+        for row in range(self.game_env.n_rows):
+            for col in range(self.game_env.n_cols):
+                # rover can never stand on a rock tile
+                if self.game_env.grid_data[row][col] == self.game_env.ROCK_TILE:
+                    continue
+                for status in crystal_statuses:
+                    states.append(GameState(row, col, status))
+        return states
