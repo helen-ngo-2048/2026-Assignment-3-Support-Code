@@ -26,12 +26,13 @@ class Solver:
 
     QL_EPSILON_START = 0.2
     QL_EPSILON_END = 0.1
-    QL_LEARNING_RATE = 0.05
+    QL_LEARNING_RATE = 0.2
 
     def __init__(self, game_env: GameEnv):
         self.game_env = game_env
         self.q_values = {}
         self.epsilon = None
+        self.ql_episode_rewards = []
 
     @staticmethod
     def testcases_to_attempt():
@@ -76,15 +77,21 @@ class Solver:
 
         self.epsilon = self.QL_EPSILON_START
 
+        # total reward of each finished training episode (for report's learning curves)
+        self.ql_episode_rewards = []
+
     def ql_train_episode(self):
         """
         Run one episode of tabular Q-learning.
         """
         state = self.game_env.get_init_state()
+        episode_reward = 0.0
+        
         for step in range(self.game_env.max_episode_steps):
             # choose an action exploration/exploitation and perform
             action = self.ql_epsilon_greedy_action(state)
             next_state, reward, err_msg = self.game_env.perform_action(state, action)
+            episode_reward += reward
 
             # target = r if S' is terminal, else r + gamma * max Q(S', a')
             terminal = self.game_env.is_terminal(next_state)
@@ -102,6 +109,7 @@ class Solver:
             if terminal:
                 break
 
+        self.ql_episode_rewards.append(episode_reward)
         self.ql_epsilon_decay()
 
     def ql_select_action(self, state: GameState):
