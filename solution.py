@@ -1,5 +1,6 @@
 import sys
 import time
+import random
 import itertools
 
 from game_env import GameEnv
@@ -23,7 +24,7 @@ class Solver:
     STUDENT_ID = "48814553"  # same as above
     GITHUB_USERNAME = "helen-ngo-2048" # same as above
 
-    QL_EPSILON_START = 1.0
+    QL_EPSILON_START = 0.2
     QL_EPSILON_END = 0.1
     QL_LEARNING_RATE = 0.05
 
@@ -79,17 +80,29 @@ class Solver:
         """
         Run one episode of tabular Q-learning.
         """
-        #
-        # TODO: Implement a single training episode here: start from self.game_env.get_init_state() and repeatedly
-        #  choose an action (e.g. epsilon-greedy), call self.game_env.perform_action and update your Q-values, until
-        #  the episode ends (a terminal state, or a step limit such as self.game_env.max_episode_steps).
-        #
-        # The tester and autograder call this method repeatedly until the training budget is exhausted, and check how
-        # well your greedy policy performs at regular checkpoints in between.
-        #
-        # In order to ensure compatibility with tester, you should avoid adding additional arguments to this function.
-        #
-        pass
+        state = self.game_env.get_init_state()
+        for step in range(self.game_env.max_episode_steps):
+            # choose an action exploration/exploitation and perform
+            action = self.ql_epsilon_greedy_action(state)
+            next_state, reward, err_msg = self.game_env.perform_action(state, action)
+
+            # target = r if S' is terminal, else r + gamma * max Q(S', a')
+            terminal = self.game_env.is_terminal(next_state)
+            if terminal:
+                target = reward
+            else:
+                next_action = self.ql_select_action(next_state)
+                target = reward + self.game_env.gamma * self.q_values[next_state][next_action]
+
+            # Q(S, a) = Q(S, a) + learning_rate * (target - Q(S, a))
+            old_q = self.q_values[state][action]
+            self.q_values[state][action] = old_q + self.QL_LEARNING_RATE * (target - old_q)
+
+            state = next_state
+            if terminal:
+                break
+
+        self.ql_epsilon_decay()
 
     def ql_select_action(self, state: GameState):
         """
@@ -97,14 +110,18 @@ class Solver:
         :param state: the current state
         :return: greedy action for the given state (element of GameEnv.ACTIONS)
         """
-        #
-        # TODO: Implement code to return the greedy action for the given state (based on your learned Q-values) here.
-        #  This method is used to evaluate your agent (including during training), so it should not explore or update
-        #  your Q-values.
-        #
-        # In order to ensure compatibility with tester, you should avoid adding additional arguments to this function.
-        #
-        pass
+        # find the highest Q-value among this state's valid actions
+        best_q = float('-inf')
+        for action in self.q_values[state]:
+            if self.q_values[state][action] > best_q:
+                best_q = self.q_values[state][action]
+
+        # collect every action with that Q-value, then break ties randomly
+        best_actions = []
+        for action in self.q_values[state]:
+            if self.q_values[state][action] == best_q:
+                best_actions.append(action)
+        return random.choice(best_actions)
 
     # === Feature-based Q-learning =====================================================================================
 
@@ -167,6 +184,23 @@ class Solver:
         pass
 
     # === Helper Methods ===============================================================================================
+
+    def ql_epsilon_greedy_action(self, state):
+        """
+        Use epsilon-greedy to select an action for a state during training.
+        With probability epsilon explore (random valid action), otherwise exploit (greedy action).
+        """
+        if random.random() < self.epsilon:
+            valid_actions = list(self.q_values[state].keys())
+            return random.choice(valid_actions)
+        return self.ql_select_action(state)
+
+    def ql_epsilon_decay(self):
+        """
+        Decay epsilon linearly over the training step budget, from QL_EPSILON_START down to QL_EPSILON_END.
+        """
+        progress = self.game_env.training_steps_used / self.game_env.training_step_budget
+        self.epsilon = max(self.QL_EPSILON_END, self.QL_EPSILON_START * (1 - progress))
 
     def get_all_states(self):
         """
