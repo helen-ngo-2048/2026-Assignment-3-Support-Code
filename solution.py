@@ -2,6 +2,7 @@ import sys
 import time
 import random
 import itertools
+from collections import deque
 
 from game_env import GameEnv
 from game_state import GameState
@@ -28,11 +29,30 @@ class Solver:
     QL_EPSILON_END = 0.1
     QL_LEARNING_RATE = 0.2
 
+    FQ_EPSILON_START = 0.2
+    FQ_EPSILON_END = 0.1
+    FQ_LEARNING_RATE = 0.1
+
+    # assume a typical boost of about 2 tiles
+    BOOST_LANDING_DISTANCE = 2
+
+    # (row change, col change) of each action
+    ACTION_DELTAS = {
+        GameEnv.WALK_LEFT: (0, -1), GameEnv.BOOST_LEFT: (0, -1), GameEnv.JUMP_LEFT: (0, -1),
+        GameEnv.WALK_RIGHT: (0, 1), GameEnv.BOOST_RIGHT: (0, 1), GameEnv.JUMP_RIGHT: (0, 1),
+        GameEnv.WALK_UP: (-1, 0), GameEnv.BOOST_UP: (-1, 0), GameEnv.JUMP_UP: (-1, 0),
+        GameEnv.WALK_DOWN: (1, 0), GameEnv.BOOST_DOWN: (1, 0), GameEnv.JUMP_DOWN: (1, 0),
+    }
+
     def __init__(self, game_env: GameEnv):
         self.game_env = game_env
         self.q_values = {}
         self.epsilon = None
         self.ql_episode_rewards = []
+        self.fq_weights = []
+        self.fq_episode_rewards = []
+        self.target_distances = {}
+        self.distance_to_go = {}
 
     @staticmethod
     def testcases_to_attempt():
@@ -137,18 +157,19 @@ class Solver:
         """
         Initialise any variables required before the start of feature-based Q-learning.
         """
-        #
-        # TODO: Implement any initialisation for feature-based Q-learning (e.g. initial weights, or pre-computing
-        #  information about the map that your features use) here. This method is not timed, so it is the place for
-        #  precomputation, but it must not call perform_action (training belongs in fq_train_episode) and must finish
-        #  within 30 seconds, or the phase scores zero.
-        #
-        # Your weights must start all 0 or all 1 (e.g. [0.0] * number of features) and be learned during training:
-        #  starting from hand-picked weights scores zero for the phase.
-        #
-        # In order to ensure compatibility with tester, you should avoid adding additional arguments to this function.
-        #
-        pass
+        self.fq_weights = [0.0, 0.0]
+        self.epsilon = self.FQ_EPSILON_START
+        self.fq_episode_rewards = []
+
+        # BFS distances from every crystal and launch site to every tile
+        self.target_distances = {}
+        for target in self.game_env.crystal_positions + self.game_env.launch_positions:
+            self.target_distances[target] = self.bfs_distances(target)
+
+        # greedy route distance of every state to avoid search during training
+        self.distance_to_go = {}
+        for state in self.get_all_states():
+            self.distance_to_go[state] = self.get_greedy_route_distance(state)
 
     def fq_get_features(self, state: GameState, action):
         """
@@ -157,25 +178,31 @@ class Solver:
         :param action: an element of GameEnv.ACTIONS
         :return: a list (or 1-D numpy array) of at most 256 numbers, the same length for every (state, action) pair
         """
-        #
-        # TODO: Implement your feature design here. Features that describe the situation (e.g. distances, risks) rather
-        #  than identify the exact state are what let your agent act well in states it never visited during training.
-        #
-        # In order to ensure compatibility with tester, you should avoid adding additional arguments to this function.
-        #
-        pass
+        landing_state = self.get_landing_state(state, action)
+        return [1.0, -self.distance_to_go[landing_state]]
 
     def fq_train_episode(self):
         """
         Run one episode of feature-based Q-learning (Q-learning with linear function approximation).
         """
-        #
-        # TODO: Implement a single training episode here, as for ql_train_episode, but updating the weights of your
-        #  linear Q-function instead of a Q-table.
-        #
-        # In order to ensure compatibility with tester, you should avoid adding additional arguments to this function.
-        #
-        pass
+        state = self.game_env.get_init_state()
+        episode_reward = 0.0
+
+        for step in range(self.game_env.max_episode_steps):
+            # choose an action exploration/exploitation and perform
+            action = self.fq_epsilon_greedy_action(state)
+            next_state, reward, err_msg = self.game_env.perform_action(state, action)
+            episode_reward += reward
+
+            terminal = self.game_env.is_terminal(next_state)
+            self.update_weights(state, action, reward, next_state, terminal)
+
+            state = next_state
+            if terminal:
+                break
+
+        self.fq_episode_rewards.append(episode_reward)
+        self.fq_epsilon_decay()
 
     def fq_select_action(self, state: GameState):
         """
@@ -183,13 +210,17 @@ class Solver:
         :param state: the current state
         :return: greedy action for the given state (element of GameEnv.ACTIONS)
         """
-        #
-        # TODO: Implement code to return the greedy action for the given state (based on your learned weights) here.
-        #  This method is also evaluated from start positions your agent never trained from.
-        #
-        # In order to ensure compatibility with tester, you should avoid adding additional arguments to this function.
-        #
-        pass
+        # find the highest Q-value among this state's valid actions, breaking ties randomly
+        best_q = float('-inf')
+        best_actions = []
+        for action in self.game_env.get_valid_actions(state):
+            q_value = self.get_q_value(state, action)
+            if q_value > best_q:
+                best_q = q_value
+                best_actions = [action]
+            elif q_value == best_q:
+                best_actions.append(action)
+        return random.choice(best_actions)
 
     # === Helper Methods ===============================================================================================
 
@@ -228,3 +259,146 @@ class Solver:
                 for status in crystal_statuses:
                     states.append(GameState(row, col, status))
         return states
+
+    def bfs_distances(self, target):
+        """
+        BFS out from target, going around Rock and Lava tiles.
+        :param target: (row, col) of the tile to measure distances to
+        :return: dict mapping (row, col) to the number of steps to target (leave out unreachable tiles)
+        """
+        distances = {target: 0}
+        queue = deque([target])
+        while len(queue) > 0:
+            row, col = queue.popleft()
+            for delta_row, delta_col in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                neighbour = (row + delta_row, col + delta_col)
+                if neighbour in distances:
+                    continue
+                if not (0 <= neighbour[0] < self.game_env.n_rows and 0 <= neighbour[1] < self.game_env.n_cols):
+                    continue
+                tile = self.game_env.grid_data[neighbour[0]][neighbour[1]]
+                if tile == self.game_env.ROCK_TILE or tile == self.game_env.LAVA_TILE:
+                    continue
+                distances[neighbour] = distances[(row, col)] + 1
+                queue.append(neighbour)
+        return distances
+
+    def get_tile_distance(self, position, target):
+        """
+        Steps from position to target, using the precomputed BFS distances. Tiles with no route get 
+        distance > any real route.
+        """
+        unreachable = self.game_env.n_rows * self.game_env.n_cols
+        return self.target_distances[target].get(position, unreachable)
+
+    def get_nearest_target(self, position, targets):
+        """
+        :return: (nearest target to position, distance to it)
+        """
+        nearest = None
+        nearest_distance = float('inf')
+        for target in targets:
+            distance = self.get_tile_distance(position, target)
+            if distance < nearest_distance:
+                nearest = target
+                nearest_distance = distance
+        return nearest, nearest_distance
+
+    def get_greedy_route_distance(self, state):
+        """
+        A3 Helper Guide: keep walking to the nearest uncollected crystal until there are enough
+        crystals, then walk to the nearest launch site.
+        :return: total steps along that route
+        """
+        position = (state.row, state.col)
+        remaining_crystals = []
+        for i in range(self.game_env.n_crystals):
+            if state.crystal_status[i] == 0:
+                remaining_crystals.append(self.game_env.crystal_positions[i])
+
+        total = 0
+        crystals_needed = self.game_env.min_samples - sum(state.crystal_status)
+        for _ in range(crystals_needed):
+            crystal, distance = self.get_nearest_target(position, remaining_crystals)
+            total += distance
+            position = crystal
+            remaining_crystals.remove(crystal)
+
+        launch_site, distance = self.get_nearest_target(position, self.game_env.launch_positions)
+        return total + distance
+
+    def get_landing_state(self, state, action):
+        """
+        The state the intended move ends in, ignoring drift and double moves. Boosts are assumed to travel
+        BOOST_LANDING_DISTANCE tiles. The move stops before Rock and on a Crater or Lava tile.
+        """
+        delta_row, delta_col = self.ACTION_DELTAS[action]
+        distance = 1
+        if action in self.game_env.BOOST_ACTIONS:
+            distance = self.BOOST_LANDING_DISTANCE
+
+        row, col = state.row, state.col
+        for _ in range(distance):
+            next_row = row + delta_row
+            next_col = col + delta_col
+            if not (0 <= next_row < self.game_env.n_rows and 0 <= next_col < self.game_env.n_cols):
+                break
+            if self.game_env.grid_data[next_row][next_col] == self.game_env.ROCK_TILE:
+                break
+            row = next_row
+            col = next_col
+            tile = self.game_env.grid_data[row][col]
+            if tile == self.game_env.CRATER_TILE or tile == self.game_env.LAVA_TILE:
+                break
+
+        # landing on an uncollected crystal collects it
+        crystal_status = state.crystal_status
+        if (row, col) in self.game_env.crystal_positions:
+            crystal_status = list(crystal_status)
+            crystal_status[self.game_env.crystal_positions.index((row, col))] = 1
+            crystal_status = tuple(crystal_status)
+        return GameState(row, col, crystal_status)
+
+    def get_q_value(self, state, action):
+        """
+        Return the Q-value of the given (state, action) pair.
+        """
+        features = self.fq_get_features(state, action)
+        q_value = 0.0
+        for i in range(len(features)):
+            q_value += self.fq_weights[i] * features[i]
+        return q_value
+
+    def update_weights(self, state, action, reward, next_state, terminal):
+        """
+        Update the feature weights from one step of experience.
+        """
+        target = reward
+        if not terminal:
+            target += self.game_env.gamma * self.get_q_value(next_state, self.fq_select_action(next_state))
+        td_error = target - self.get_q_value(state, action)
+
+        features = self.fq_get_features(state, action)
+        squared_size = 0.0
+        for feature in features:
+            squared_size += feature * feature
+
+        step = self.FQ_LEARNING_RATE * td_error / squared_size
+        for i in range(len(features)):
+            self.fq_weights[i] += step * features[i]
+
+    def fq_epsilon_greedy_action(self, state):
+        """
+        Use epsilon-greedy to select an action for a state during training.
+        With probability epsilon explore (random valid action), otherwise exploit (greedy action).
+        """
+        if random.random() < self.epsilon:
+            return random.choice(self.game_env.get_valid_actions(state))
+        return self.fq_select_action(state)
+
+    def fq_epsilon_decay(self):
+        """
+        Decay epsilon linearly over the training step budget.
+        """
+        progress = self.game_env.training_steps_used / self.game_env.training_step_budget
+        self.epsilon = max(self.FQ_EPSILON_END, self.FQ_EPSILON_START * (1 - progress))
