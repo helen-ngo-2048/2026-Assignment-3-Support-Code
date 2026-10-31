@@ -160,7 +160,7 @@ class Solver:
         """
         Initialise any variables required before the start of feature-based Q-learning.
         """
-        self.fq_weights = [0.0] * 8
+        self.fq_weights = [0.0] * 9
         self.epsilon = self.FQ_EPSILON_START
         self.fq_episode_rewards = []
 
@@ -210,8 +210,13 @@ class Solver:
         if landing_state.row == state.row and landing_state.col == state.col:
             goes_nowhere = 1.0
 
+        # craters cost more than ground
+        lands_in_crater = 0.0
+        if self.game_env.grid_data[landing_state.row][landing_state.col] == self.game_env.CRATER_TILE:
+            lands_in_crater = 1.0
+
         return [is_walk, is_boost, is_jump, -distance,
-                lava_features[0], lava_features[1], lava_features[2], goes_nowhere]
+                lava_features[0], lava_features[1], lava_features[2], goes_nowhere, lands_in_crater]
 
     def fq_train_episode(self):
         """
@@ -463,10 +468,19 @@ class Solver:
     def fq_epsilon_greedy_action(self, state):
         """
         Use epsilon-greedy to select an action for a state during training.
-        With probability epsilon explore (random valid action), otherwise exploit (greedy action).
+        With probability epsilon explore (random valid action that avoids lava), otherwise exploit (greedy action).
         """
         if random.random() < self.epsilon:
-            return random.choice(self.game_env.get_valid_actions(state))
+            valid_actions = self.game_env.get_valid_actions(state)
+            # only explore moves that dont go into lava
+            safe_actions = []
+            for action in valid_actions:
+                if self.lava_features[(state.row, state.col, action)][0] == 0.0:
+                    safe_actions.append(action)
+
+            if len(safe_actions) == 0:
+                return random.choice(valid_actions)
+            return random.choice(safe_actions)
         return self.fq_select_action(state)
 
     def fq_epsilon_decay(self):
