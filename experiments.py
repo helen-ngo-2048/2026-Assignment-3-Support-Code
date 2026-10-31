@@ -5,7 +5,8 @@ import csv
 import matplotlib.pyplot as plt
 
 from game_env import GameEnv, TrainingBudgetExhausted
-from harness import get_phase_value, seed_solver_randomness, train_agent, evaluate_final_policy
+from harness import get_phase_value, get_learning_threshold, seed_solver_randomness, train_agent, \
+    evaluate_final_policy, evaluate_generalisation
 from solution import Solver
 
 """
@@ -17,6 +18,8 @@ the total reward of every training episode, saves it to CSV and plots the 50-epi
 Usage:
     python experiments.py lr [testcase_file ...]        train each learning rate, save CSVs and plot
     python experiments.py replot [testcase_file ...]    redraw the plot from the saved CSVs
+    python experiments.py compare [testcase_file ...]   compare QL and FQ (report Q4a)
+    python experiments.py weights [testcase_file ...]   table of learned FQ weights (report Q3b)
 
 Example:
     python experiments.py lr testcases/L1.txt testcases/L3.txt
@@ -26,6 +29,9 @@ RESULTS_DIR = 'results'
 MOVING_AVERAGE_WINDOW = 50
 # too slow, just right, too fast (0.01, 0.4 and 0.6 were also tried)
 LEARNING_RATES = [0.05, 0.2, 0.8]
+# in the same order as fq_get_features
+FEATURE_LABELS = ['is walk', 'is boost', 'is jump', '-route distance to go', '-lava: intended move', '-lava: drift',
+                  '-lava: double move', 'goes nowhere', 'lands in crater']
 
 
 def train_ql(testcase_file, learning_rate):
@@ -140,14 +146,125 @@ def replot_learning_rates(testcase_file):
                  os.path.join(RESULTS_DIR, f'ql_learning_rates_{name}.png'))
 
 
+def train_for_comparison(testcase_file, plan_type):
+    """
+    Train one algorithm exactly as tester.py does, recording the training steps used after every finished episode.
+    :return: (solver, training result, control_env, steps used after each episode)
+    """
+    game_env = GameEnv(testcase_file)
+    control_env = GameEnv(testcase_file)
+
+    game_env.set_training_budget(get_phase_value(game_env, plan_type, 'training_step_budget'),
+                                 get_phase_value(game_env, plan_type, 'training_reward_budget'))
+    seed_solver_randomness(control_env.episode_seed)
+    solver = Solver(game_env)
+
+    steps_after_episode = []
+    if plan_type == 'ql':
+        train_episode = solver.ql_train_episode
+    else:
+        train_episode = solver.fq_train_episode
+
+    def train_and_record():
+        train_episode()
+        steps_after_episode.append(game_env.training_steps_used)
+
+    if plan_type == 'ql':
+        solver.ql_train_episode = train_and_record
+    else:
+        solver.fq_train_episode = train_and_record
+
+    result = train_agent(game_env, control_env, solver, plan_type, TrainingBudgetExhausted)
+    return solver, result, control_env, steps_after_episode
+
+
+def get_episodes_to_threshold(steps_after_episode, learned_at_steps):
+    """
+    The harness reports the steps used when the threshold was reached, so find which episode that was.
+    """
+    if learned_at_steps is None:
+        return None
+    for i in range(len(steps_after_episode)):
+        if steps_after_episode[i] >= learned_at_steps:
+            return i + 1
+    return None
+
+
+def run_comparison(testcase_file):
+    """
+    Report Q4(a): compare tabular and feature-based Q-learning on one testcase with the same evaluation protocol.
+    """
+    name = os.path.basename(testcase_file).split('.')[0]
+    rewards_by_label = {}
+    rows = [['algorithm', 'learning_threshold', 'episodes_to_threshold', 'steps_to_threshold', 'mean_eval_reward',
+             'solved_of_1000', 'training_episodes', 'training_steps', 'time_per_step', 'generalisation_reward']]
+
+    for plan_type in ['ql', 'fq']:
+        solver, result, control_env, steps_after_episode = train_for_comparison(testcase_file, plan_type)
+        if plan_type == 'ql':
+            select_action = solver.ql_select_action
+            rewards = solver.ql_episode_rewards
+            label = 'Tabular Q-learning'
+            generalisation = ''
+        else:
+            select_action = solver.fq_select_action
+            rewards = solver.fq_episode_rewards
+            label = 'Feature-based Q-learning'
+            generalisation = round(evaluate_generalisation(control_env, select_action), 1)
+
+        average_reward, solved_count = evaluate_final_policy(control_env, select_action, plan_type)
+        rewards_by_label[label] = rewards
+        save_rewards(os.path.join(RESULTS_DIR, f'compare_{plan_type}_{name}.csv'), rewards)
+        rows.append([label, round(get_learning_threshold(control_env, plan_type), 1),
+                     get_episodes_to_threshold(steps_after_episode, result.learned_at_steps), result.learned_at_steps,
+                     round(average_reward, 1), solved_count, len(rewards), result.steps_used,
+                     result.get_time_per_step(), generalisation])
+
+    with open(os.path.join(RESULTS_DIR, f'compare_metrics_{name}.csv'), 'w', newline='') as f:
+        csv.writer(f).writerows(rows)
+    for row in rows:
+        print(row)
+
+    plot_rewards(rewards_by_label, f'{name}: tabular vs feature-based Q-learning',
+                 os.path.join(RESULTS_DIR, f'compare_learning_curves_{name}.png'))
+
+
+def run_weights_table(testcase_files):
+    """
+    Report Q3(b): the learned feature weights on each testcase.
+    """
+    names = []
+    weights_by_testcase = []
+    for testcase_file in testcase_files:
+        names.append(os.path.basename(testcase_file).split('.')[0])
+        solver, result, control_env, steps_after_episode = train_for_comparison(testcase_file, 'fq')
+        weights_by_testcase.append(solver.fq_weights)
+
+    with open(os.path.join(RESULTS_DIR, 'fq_weights.csv'), 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['feature'] + names)
+        print(['feature'] + names)
+        for i in range(len(FEATURE_LABELS)):
+            row = [FEATURE_LABELS[i]]
+            for weights in weights_by_testcase:
+                row.append(round(weights[i], 3))
+            writer.writerow(row)
+            print(row)
+
+
 def main(arglist):
-    if len(arglist) < 2 or arglist[0] not in ['lr', 'replot']:
-        print('Usage: python experiments.py [lr|replot] [testcase_file ...]')
+    if len(arglist) < 2 or arglist[0] not in ['lr', 'replot', 'compare', 'weights']:
+        print('Usage: python experiments.py [lr|replot|compare|weights] [testcase_file ...]')
         return
     os.makedirs(RESULTS_DIR, exist_ok=True)
+    if arglist[0] == 'weights':
+        run_weights_table(arglist[1:])
+        return
     for testcase_file in arglist[1:]:
         if arglist[0] == 'lr':
             run_learning_rate_experiment(testcase_file)
+        elif arglist[0] == 'compare':
+            run_comparison(testcase_file)
         else:
             replot_learning_rates(testcase_file)
 
