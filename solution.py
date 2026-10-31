@@ -2,7 +2,7 @@ import sys
 import time
 import random
 import itertools
-from collections import deque
+import heapq
 
 from game_env import GameEnv
 from game_state import GameState
@@ -37,6 +37,9 @@ class Solver:
     BOOST_LANDING_DISTANCE = 2
     MAX_BOOST_DISTANCE = 4
     LAVA_SCALE = 500.0
+
+    # extra steps a route is charged for each tile next to lava so that safer routes look shorter
+    LAVA_RISK_COST = 8
 
     # (row change, col change) of each action
     ACTION_DELTAS = {
@@ -164,10 +167,10 @@ class Solver:
         self.epsilon = self.FQ_EPSILON_START
         self.fq_episode_rewards = []
 
-        # BFS distances from every crystal and launch site to every tile
+        # route distances from every crystal and launch site to every tile
         self.target_distances = {}
         for target in self.game_env.crystal_positions + self.game_env.launch_positions:
-            self.target_distances[target] = self.bfs_distances(target)
+            self.target_distances[target] = self.get_route_distances(target)
 
         # greedy route distance of every state to avoid search during training
         self.distance_to_go = {}
@@ -297,35 +300,54 @@ class Solver:
                     states.append(GameState(row, col, status))
         return states
 
-    def bfs_distances(self, target):
+    def is_next_to_lava(self, row, col):
         """
-        BFS out from target, going around Rock and Lava tiles.
+        Check whether a tile has lava directly next to it.
+        """
+        for delta_row, delta_col in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            next_row = row + delta_row
+            next_col = col + delta_col
+            if 0 <= next_row < self.game_env.n_rows and 0 <= next_col < self.game_env.n_cols:
+                if self.game_env.grid_data[next_row][next_col] == self.game_env.LAVA_TILE:
+                    return True
+        return False
+
+    def get_route_distances(self, target):
+        """
+        Uniform-cost search out from target, going around Rock and Lava tiles. Tiles next to lava cost extra.
         :param target: (row, col) of the tile to measure distances to
-        :return: dict mapping (row, col) to the number of steps to target (leave out unreachable tiles)
+        :return: dict mapping (row, col) to the route cost to target (leave out unreachable tiles)
         """
         distances = {target: 0}
-        queue = deque([target])
+        queue = [(0, target)]
         while len(queue) > 0:
-            row, col = queue.popleft()
+            distance, (row, col) = heapq.heappop(queue)
+            if distance > distances[(row, col)]:
+                continue
+
+            step_cost = 1
+            if self.is_next_to_lava(row, col):
+                step_cost += self.LAVA_RISK_COST
+
             for delta_row, delta_col in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 neighbour = (row + delta_row, col + delta_col)
-                if neighbour in distances:
-                    continue
                 if not (0 <= neighbour[0] < self.game_env.n_rows and 0 <= neighbour[1] < self.game_env.n_cols):
                     continue
                 tile = self.game_env.grid_data[neighbour[0]][neighbour[1]]
                 if tile == self.game_env.ROCK_TILE or tile == self.game_env.LAVA_TILE:
                     continue
-                distances[neighbour] = distances[(row, col)] + 1
-                queue.append(neighbour)
+                new_distance = distance + step_cost
+                if neighbour not in distances or new_distance < distances[neighbour]:
+                    distances[neighbour] = new_distance
+                    heapq.heappush(queue, (new_distance, neighbour))
         return distances
 
     def get_tile_distance(self, position, target):
         """
-        Steps from position to target, using the precomputed BFS distances. Tiles with no route get 
-        distance > any real route.
+        Route cost from position to target, using the precomputed distances. Tiles with no route get
+        a cost > any real route.
         """
-        unreachable = self.game_env.n_rows * self.game_env.n_cols
+        unreachable = (1 + self.LAVA_RISK_COST) * self.game_env.n_rows * self.game_env.n_cols
         return self.target_distances[target].get(position, unreachable)
 
     def get_nearest_target(self, position, targets):
