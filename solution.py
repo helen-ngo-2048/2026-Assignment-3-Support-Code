@@ -35,6 +35,8 @@ class Solver:
 
     # assume a typical boost of about 2 tiles
     BOOST_LANDING_DISTANCE = 2
+    MAX_BOOST_DISTANCE = 4
+    LAVA_SCALE = 500.0
 
     # (row change, col change) of each action
     ACTION_DELTAS = {
@@ -53,6 +55,7 @@ class Solver:
         self.fq_episode_rewards = []
         self.target_distances = {}
         self.distance_to_go = {}
+        self.lava_features = {}
 
     @staticmethod
     def testcases_to_attempt():
@@ -157,7 +160,7 @@ class Solver:
         """
         Initialise any variables required before the start of feature-based Q-learning.
         """
-        self.fq_weights = [0.0, 0.0]
+        self.fq_weights = [0.0] * 8
         self.epsilon = self.FQ_EPSILON_START
         self.fq_episode_rewards = []
 
@@ -171,6 +174,13 @@ class Solver:
         for state in self.get_all_states():
             self.distance_to_go[state] = self.get_greedy_route_distance(state)
 
+        # lava risks only depend on the map
+        self.lava_features = {}
+        for row in range(self.game_env.n_rows):
+            for col in range(self.game_env.n_cols):
+                for action in self.game_env.ACTIONS:
+                    self.lava_features[(row, col, action)] = self.get_lava_features(row, col, action)
+
     def fq_get_features(self, state: GameState, action):
         """
         Return the feature vector of the given (state, action) pair, so that Q(s, a) = w . features(s, a).
@@ -179,7 +189,29 @@ class Solver:
         :return: a list (or 1-D numpy array) of at most 256 numbers, the same length for every (state, action) pair
         """
         landing_state = self.get_landing_state(state, action)
-        return [1.0, -self.distance_to_go[landing_state]]
+        lava_features = self.lava_features[(state.row, state.col, action)]
+        is_walk = 0.0
+        is_boost = 0.0
+        is_jump = 0.0
+        if action in self.game_env.WALK_ACTIONS:
+            is_walk = 1.0
+        elif action in self.game_env.BOOST_ACTIONS:
+            is_boost = 1.0
+        else:
+            is_jump = 1.0
+
+        # a move into lava ends the episode so it keeps the current distance
+        distance = self.distance_to_go[landing_state]
+        if self.game_env.grid_data[landing_state.row][landing_state.col] == self.game_env.LAVA_TILE:
+            distance = self.distance_to_go[state]
+
+        # move blocked by rock so the rover would stay on the same tile
+        goes_nowhere = 0.0
+        if landing_state.row == state.row and landing_state.col == state.col:
+            goes_nowhere = 1.0
+
+        return [is_walk, is_boost, is_jump, -distance,
+                lava_features[0], lava_features[1], lava_features[2], goes_nowhere]
 
     def fq_train_episode(self):
         """
@@ -326,6 +358,47 @@ class Solver:
 
         launch_site, distance = self.get_nearest_target(position, self.game_env.launch_positions)
         return total + distance
+
+    def path_reaches_lava(self, row, col, action, distance):
+        """
+        Check whether moving in the action's direction runs into lava.
+        Rock and craters end the move safely.
+        """
+        delta_row, delta_col = self.ACTION_DELTAS[action]
+        for _ in range(distance):
+            row += delta_row
+            col += delta_col
+            if not (0 <= row < self.game_env.n_rows and 0 <= col < self.game_env.n_cols):
+                return False
+            tile = self.game_env.grid_data[row][col]
+            if tile == self.game_env.LAVA_TILE:
+                return True
+            if tile == self.game_env.ROCK_TILE or tile == self.game_env.CRATER_TILE:
+                return False
+        return False
+
+    def get_lava_features(self, row, col, action):
+        """
+        The 3 lava risks of an action: intended move, drift, double move.
+        """
+        distance = 1
+        if action in self.game_env.BOOST_ACTIONS:
+            distance = self.MAX_BOOST_DISTANCE
+
+        intended = 0.0
+        if self.path_reaches_lava(row, col, action, distance):
+            intended = 1.0
+
+        drift = 0.0
+        for drift_action in self.game_env.PERPENDICULAR_ACTIONS[action]:
+            if self.path_reaches_lava(row, col, drift_action, distance):
+                drift += 0.5
+
+        double = 0.0
+        if self.path_reaches_lava(row, col, action, 2 * distance):
+            double = 1.0
+
+        return [-self.LAVA_SCALE * intended, -self.LAVA_SCALE * drift, -self.LAVA_SCALE * double]
 
     def get_landing_state(self, state, action):
         """
